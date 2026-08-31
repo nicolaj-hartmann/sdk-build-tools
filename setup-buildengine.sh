@@ -45,10 +45,14 @@ OPT_UPLOAD_PATH=$DEF_UPLOAD_PATH
 OPT_COMPRESSION=9
 OPT_RELEASE="latest"
 OPT_TOOLING=
-declare -A OPT_TARGETS=()
+# Keep macOS bash 3.2 compatibility: no associative arrays, no ${var^^}
+OPT_TARGET_ARCHES=()
+OPT_TARGET_FILES=()
 OPT_VM="MerSDK.build"
 OPT_VDI=
 OPT_TARGET_BASENAME=${DEF_TARGET_BASENAME}
+OPT_VM_MEMORY=1024
+OPT_QEMU_ARGS=
 
 # some static settings for the VM
 SSH_PORT=2222
@@ -69,22 +73,100 @@ fatal() {
     return ${PIPESTATUS[0]}
 }
 
+# ---------------------------------------------------------------------
+# VM backends: VirtualBox (x86 hosts) and QEMU (native aarch64 guests on
+# Apple Silicon, using the same hypervisor acceleration as the emulator)
+
 vboxmanage_wrapper() {
     echo "VBoxManage $@"
     VBoxManage "$@"
     [[ $? -ne 0 ]] && fatal "VBoxManage failed"
 }
 
+qemu_wrapper() {
+    echo "qemu-system-aarch64 $@"
+    qemu-system-aarch64 "$@"
+    [[ $? -ne 0 ]] && fatal "qemu-system-aarch64 failed"
+}
+
+qemu_img_wrapper() {
+    echo "qemu-img $@"
+    qemu-img "$@"
+    [[ $? -ne 0 ]] && fatal "qemu-img failed"
+}
+
+qemu_find_efi() {
+    # edk2 aarch64 firmware shipped with homebrew/system qemu
+    local candidates="/opt/homebrew/share/qemu/edk2-aarch64-code.fd \
+                      /usr/local/share/qemu/edk2-aarch64-code.fd \
+                      /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
+                      /usr/share/edk2/aarch64/QEMU_EFI.fd"
+    local fw
+    for fw in $candidates; do
+        [[ -f $fw ]] && { echo "$fw"; return 0; }
+    done
+    return 1
+}
+
+# QEMU process management (pidfile lives in the VM basefolder, see initPaths)
+qemu_vm_running() {
+    [[ -f $VM_BASEFOLDER/qemu.pid ]] && kill -0 $(cat $VM_BASEFOLDER/qemu.pid) 2>/dev/null
+}
+
+qemu_stop_vm() {
+    if qemu_vm_running; then
+        echo "Powering off QEMU VM (pid $(cat $VM_BASEFOLDER/qemu.pid))"
+        kill $(cat $VM_BASEFOLDER/qemu.pid) 2>/dev/null
+    fi
+    rm -f $VM_BASEFOLDER/qemu.pid
+}
+
+# Run a command in the engine over ssh. Fails fast when the engine is not
+# reachable instead of hanging forever.
+engine_ssh() {
+    ssh -o UserKnownHostsFile=/dev/null \
+        -o StrictHostKeyChecking=no \
+        -o ConnectTimeout=10 \
+        -o ConnectionAttempts=2 \
+        -p $SSH_PORT \
+        -i $SSHCONFIG_PATH/vmshare/ssh/private_keys/engine/mersdk \
+        mersdk@localhost "$@"
+}
+
 unregisterVm() {
+    if [[ $OPT_BACKEND == "qemu" ]]; then
+        echo "Stopping QEMU VM $OPT_VM"
+        qemu_stop_vm
+        return
+    fi
     echo "Unregistering $OPT_VM"
     # make sure the VM is not running
     VBoxManage controlvm "$OPT_VM" poweroff 2>/dev/null
     VBoxManage unregistervm "$OPT_VM" --delete 2>/dev/null
 }
 
+prepareQemuDisk() {
+    # Accept the same inputs as the VirtualBox flow: a raw/VDI file gets
+    # converted to qcow2 once; qcow2 images are used as-is.
+    local src=$OPT_VDI
+    local dest=$VM_BASEFOLDER/mer.qcow2
+    if [[ $dest -ef $src ]]; then
+        OPT_QEMU_DISK=$src
+        return
+    fi
+    mkdir -p $VM_BASEFOLDER
+    echo "Converting $src => $dest"
+    qemu_img_wrapper convert -O qcow2 "$src" "$dest"
+    OPT_QEMU_DISK=$dest
+}
+
 createVM() {
+    if [[ $OPT_BACKEND == "qemu" ]]; then
+        prepareQemuDisk
+        return
+    fi
     vboxmanage_wrapper createvm --basefolder=$VM_BASEFOLDER --name "$OPT_VM" --ostype Linux26 --register
-    vboxmanage_wrapper modifyvm "$OPT_VM" --memory 1024 --vram 128 --accelerate3d off
+    vboxmanage_wrapper modifyvm "$OPT_VM" --memory $OPT_VM_MEMORY --vram 128 --accelerate3d off
     vboxmanage_wrapper storagectl "$OPT_VM" --name "SATA" --add sata --controller IntelAHCI $SATACOMMAND 1
     vboxmanage_wrapper storageattach "$OPT_VM" --storagectl SATA --port 0 --type hdd --mtype normal --medium $OPT_VDI
     vboxmanage_wrapper modifyvm "$OPT_VM" --nic1 nat --nictype1 virtio
@@ -98,7 +180,9 @@ createVM() {
 createShares() {
     # put 'ssh' and 'vmshare' into $SSHCONFIG_PATH
     mkdir -p $SSHCONFIG_PATH/ssh/mersdk
-    vboxmanage_wrapper sharedfolder add "$OPT_VM" --name ssh --hostpath $SSHCONFIG_PATH/ssh
+    if [[ $OPT_BACKEND != "qemu" ]]; then
+        vboxmanage_wrapper sharedfolder add "$OPT_VM" --name ssh --hostpath $SSHCONFIG_PATH/ssh
+    fi
 
     mkdir -p $SSHCONFIG_PATH/vmshare/ssh/private_keys/engine
     pushd $SSHCONFIG_PATH/vmshare/ssh/private_keys/engine
@@ -115,15 +199,81 @@ createShares() {
     </engine>
 </devices>
 EOF
-    vboxmanage_wrapper sharedfolder add "$OPT_VM" --name config --hostpath $SSHCONFIG_PATH/vmshare
+    if [[ $OPT_BACKEND != "qemu" ]]; then
+        vboxmanage_wrapper sharedfolder add "$OPT_VM" --name config --hostpath $SSHCONFIG_PATH/vmshare
+    fi
 
     # and then 'targets' and 'home' for $INSTALL_PATH
     mkdir -p $INSTALL_PATH/targets
+    if [[ $OPT_BACKEND == "qemu" ]]; then
+        # Shared via virtio-9p with tags matching the VBox share names,
+        # mounted to the expected in-engine paths after first boot (see
+        # mountSharesQemu)
+        return
+    fi
     vboxmanage_wrapper sharedfolder add "$OPT_VM" --name targets --hostpath $INSTALL_PATH/targets
     vboxmanage_wrapper sharedfolder add "$OPT_VM" --name home --hostpath $INSTALL_PATH
 }
 
+mountSharesQemu() {
+    # Mount the 9p shares to the paths where the engine integration expects
+    # the VirtualBox shared folders. Idempotent.
+    engine_ssh '
+            set -e
+            for pair in ssh:/host_ssh config:/host_config targets:/host_targets home:/host_home; do
+                tag=${pair%%:*}
+                mnt=${pair#*:}
+                sudo mkdir -p "$mnt"
+                grep -q " $mnt 9p" /proc/mounts || \
+                    sudo mount -t 9p -o trans=virtio,version=9p2000.L "$tag" "$mnt"
+            done
+        '
+}
+
 startVM() {
+    if [[ $OPT_BACKEND == "qemu" ]]; then
+        local -a qemu_args=(
+            -M virt -cpu host -accel hvf -smp $(nproc) -m $OPT_VM_MEMORY
+            -nic user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22,hostfwd=tcp:127.0.0.1:${HTTP_PORT}-:9292
+            -fsdev local,id=sf_ssh,path=$SSHCONFIG_PATH/ssh,security_model=mapped-xattr
+            -fsdev local,id=sf_config,path=$SSHCONFIG_PATH/vmshare,security_model=mapped-xattr
+            -fsdev local,id=sf_targets,path=$INSTALL_PATH/targets,security_model=mapped-xattr
+            -fsdev local,id=sf_home,path=$INSTALL_PATH,security_model=mapped-xattr
+            -device virtio-9p-pci,fsdev=sf_ssh,mount_tag=ssh
+            -device virtio-9p-pci,fsdev=sf_config,mount_tag=config
+            -device virtio-9p-pci,fsdev=sf_targets,mount_tag=targets
+            -device virtio-9p-pci,fsdev=sf_home,mount_tag=home
+            -drive file=$OPT_QEMU_DISK,if=virtio,format=qcow2
+            -display none -serial file:$VM_BASEFOLDER/console.log
+            -pidfile $VM_BASEFOLDER/qemu.pid -daemonize
+        )
+        if [[ -n $OPT_KERNEL ]]; then
+            qemu_args+=(-kernel $OPT_KERNEL)
+            [[ -n $OPT_INITRD ]] && qemu_args+=(-initrd $OPT_INITRD)
+            [[ -n $OPT_APPEND ]] && qemu_args+=(-append "$OPT_APPEND")
+        else
+            local efi=
+            efi=$(qemu_find_efi) || fatal "No aarch64 EFI firmware found (install qemu with edk2 bits or pass --kernel)"
+            qemu_args+=(-bios $efi)
+        fi
+
+        # allow the caller to override/extend anything from above
+        if [[ -n $OPT_QEMU_ARGS ]]; then
+            # shellcheck disable=SC2206
+            qemu_args+=($OPT_QEMU_ARGS)
+        fi
+
+        mkdir -p $VM_BASEFOLDER
+        echo "qemu-system-aarch64 ${qemu_args[*]} (daemonizing)"
+        # detach the daemon's stdio from this script so that callers piping
+        # our output do not block forever
+        qemu-system-aarch64 "${qemu_args[@]}" </dev/null >> $VM_BASEFOLDER/qemu.out 2>&1
+        [[ $? -ne 0 ]] && fatal "qemu-system-aarch64 failed (see $VM_BASEFOLDER/qemu.out)"
+
+        # wait a few seconds
+        sleep 2
+        return
+    fi
     vboxmanage_wrapper startvm --type headless "$OPT_VM"
 
     # wait a few seconds
@@ -143,11 +293,7 @@ installTooling() {
     ln $OPT_TOOLING $INSTALL_PATH/
 
     echo "Creating tooling ..."
-    ssh -o UserKnownHostsFile=/dev/null \
-        -o StrictHostKeyChecking=no \
-        -p $SSH_PORT \
-        -i $SSHCONFIG_PATH/vmshare/ssh/private_keys/engine/mersdk \
-        mersdk@localhost "sdk-manage --mode installer --tooling --install $tooling file:///host_home/$file"
+    engine_ssh "sdk-manage --mode installer --tooling --install $tooling file:///host_home/$file"
 }
 
 installTarget() {
@@ -163,11 +309,7 @@ installTarget() {
     ln $file $INSTALL_PATH/
 
     echo "Creating target ..."
-    ssh -o UserKnownHostsFile=/dev/null \
-        -o StrictHostKeyChecking=no \
-        -p $SSH_PORT \
-        -i $SSHCONFIG_PATH/vmshare/ssh/private_keys/engine/mersdk \
-        mersdk@localhost "sdk-manage --mode installer --target --install --jfdi $tgt file:///host_home/$file"
+    engine_ssh "sdk-manage --mode installer --target --install --jfdi $tgt file:///host_home/$file"
 }
 
 createTar() {
@@ -246,7 +388,7 @@ checkForRequiredFiles() {
         fatal "Tooling file [$OPT_TOOLING] not found in the current directory."
     fi
 
-    for target_filename in "${OPT_TARGETS[@]}"; do
+    for target_filename in "${OPT_TARGET_FILES[@]}"; do
         if [ ! -e "$target_filename" ] ; then
             fatal "Target file [$target_filename] not found in the current directory."
         fi
@@ -258,11 +400,15 @@ packVM() {
     # Shut down the VM so it won't interfere (and make sure it's down). This
     # will probably fail because sdk-shutdown has already done its job, so
     # ignore any error output.
-    VBoxManage controlvm "$OPT_VM" poweroff 2>/dev/null
+    if [[ $OPT_BACKEND == "qemu" ]]; then
+        qemu_stop_vm
+    else
+        VBoxManage controlvm "$OPT_VM" poweroff 2>/dev/null
+    fi
 
     # remove target archive files
     rm -f $INSTALL_PATH/$OPT_TOOLING
-    for target_filename in "${OPT_TARGETS[@]}"; do
+    for target_filename in "${OPT_TARGET_FILES[@]}"; do
         rm -f "$INSTALL_PATH/$target_filename"
     done
 
@@ -270,9 +416,14 @@ packVM() {
     rm -f $INSTALL_PATH/.bash_history $INSTALL_PATH/refresh-sdk-repos.sh
     rm -f $INSTALL_PATH/hack-snapshots-cow.sh
 
-    # copy the used VDI file:
-    echo "Hard linking $PWD/$OPT_VDI => $INSTALL_PATH/mer.vdi"
-    ln $PWD/$OPT_VDI $INSTALL_PATH/mer.vdi
+    # copy the used disk image:
+    if [[ $OPT_BACKEND == "qemu" ]]; then
+        echo "Hard linking $OPT_QEMU_DISK => $INSTALL_PATH/mer.qcow2"
+        ln $OPT_QEMU_DISK $INSTALL_PATH/mer.qcow2
+    else
+        echo "Hard linking $PWD/$OPT_VDI => $INSTALL_PATH/mer.vdi"
+        ln $PWD/$OPT_VDI $INSTALL_PATH/mer.vdi
+    fi
 
     mkdir -p vmshare
     cp $SSHCONFIG_PATH/vmshare/df.cache vmshare/
@@ -336,32 +487,41 @@ Usage:
    $(basename $0) unregister [-vm <NAME>]   unregister the VM
 
 Options:
-   -u   | --upload <DIR>       upload local build result to [$OPT_UPLOAD_HOST] as user [$OPT_UPLOAD_USER]
-                               the uploaded build will be copied to [$OPT_UPLOAD_PATH/<DIR>]
-                               the upload directory will be created if it is not there
-   -uh  | --uhost <HOST>       override default upload host
-   -up  | --upath <PATH>       override default upload path
-   -uu  | --uuser <USER>       override default upload user
-   -y   | --non-interactive    answer yes to all questions presented by the script
-   -f   | --vdi-file <VDI>     use <VDI> file as the virtual disk image [required]
-   -i   | --ignore-running     ignore running VMs
-   -r   | --refresh            force a zypper refresh for MerSDK and sb2 targets
-   -p   | --private            use private rpm repository in 10.21.0.20
-   -td  | --test-domain        keep test domain after refreshing the repos
-   -o   | --orig-release <REL> turn ssu release to this instead of latest after refreshing repos
-   -rel | --release <REL>      release number to mention in tooling/target names
-   -c   | --compression <0-9>  compression level of 7z [$OPT_COMPRESSION]
-   -nc  | --no-compression     do not create the 7z
-   -t   | --tooling <FILE>     tooling tarball <FILE>, must be in current directory
-   --target-<ARCH> <FILE>      <ARCH> target rootstrap <FILE>, must be in current directory
-   -un  | --unregister         unregister the created VM at the end of script run
-   -hax | --horrible-hack      disable jolla-core.check systemCheck file
-   -vm  | --vm-name <NAME>     create VM with <NAME> [$OPT_VM]
-   --no-meta                   suppress creating meta data files with
-                               'make-archive-meta.sh'
-   --target-basename <NAME>    base name for tooling and targets, 
-                               must use alphanumeric characters only [$OPT_TARGET_BASENAME]
-   -h   | --help               this help
+    -u   | --upload <DIR>       upload local build result to [$OPT_UPLOAD_HOST] as user [$OPT_UPLOAD_USER]
+                                the uploaded build will be copied to [$OPT_UPLOAD_PATH/<DIR>]
+                                the upload directory will be created if it is not there
+    -uh  | --uhost <HOST>       override default upload host
+    -up  | --upath <PATH>       override default upload path
+    -uu  | --uuser <USER>       override default upload user
+    -y   | --non-interactive    answer yes to all questions presented by the script
+    -f   | --vdi-file <VDI>     use <VDI> file as the virtual disk image [required]
+                                on the qemu backend .vdi files are converted to
+                                qcow2, .qcow2 and raw images are used as-is
+    -i   | --ignore-running     ignore running VMs
+    -r   | --refresh            force a zypper refresh for MerSDK and sb2 targets
+    -p   | --private            use private rpm repository in 10.21.0.20
+    -td  | --test-domain        keep test domain after refreshing the repos
+    -o   | --orig-release <REL> turn ssu release to this instead of latest after refreshing repos
+    -rel | --release <REL>      release number to mention in tooling/target names
+    -c   | --compression <0-9>  compression level of 7z [$OPT_COMPRESSION]
+    -nc  | --no-compression     do not create the 7z
+    -t   | --tooling <FILE>     tooling tarball <FILE>, must be in current directory
+    --target-<ARCH> <FILE>      <ARCH> target rootstrap <FILE>, must be in current directory
+    -un  | --unregister         unregister the created VM at the end of script run
+    -hax | --horrible-hack      disable jolla-core.check systemCheck file
+    -vm  | --vm-name <NAME>     create VM with <NAME> [$OPT_VM]
+    --no-meta                   suppress creating meta data files with
+                                'make-archive-meta.sh'
+    --target-basename <NAME>    base name for tooling and targets,
+                                must use alphanumeric characters only [$OPT_TARGET_BASENAME]
+    --backend <BACKEND>         virtualization backend: vbox or qemu
+                                [auto: qemu on arm64 macOS, vbox otherwise]
+    --memory <MB>               guest memory in MB [$OPT_VM_MEMORY]
+    --kernel <FILE>             (qemu) boot this kernel image directly
+    --initrd <FILE>             (qemu) initrd for --kernel
+    --append <STR>              (qemu) kernel command line for --kernel
+    --qemu-args <ARGS>          (qemu) extra arguments passed to qemu-system-aarch64
+    -h   | --help               this help
 
 EOF
 
@@ -392,7 +552,8 @@ while [[ ${1:-} ]]; do
             ;;
         --target-* )
             # Enforce that the file resides under CWD for sharing with build engine
-            OPT_TARGETS[${1#--target-}]=$(basename $2)
+            OPT_TARGET_ARCHES+=(${1#--target-})
+            OPT_TARGET_FILES+=($(basename $2))
             shift 2
             ;;
         -td | --test-domain ) shift
@@ -456,16 +617,58 @@ while [[ ${1:-} ]]; do
             OPT_TARGET_BASENAME=$1; shift
             [[ -z $OPT_TARGET_BASENAME ]] && fatal "empty target-basename option given"
             ;;
+        --backend ) shift
+            OPT_BACKEND=$1; shift
+            case $OPT_BACKEND in
+                vbox|qemu) ;;
+                *) fatal "unknown backend [$OPT_BACKEND], use vbox or qemu"
+            esac
+            ;;
+        --memory ) shift
+            OPT_VM_MEMORY=$1; shift
+            ;;
+        --kernel ) shift
+            OPT_KERNEL=$1; shift
+            ;;
+        --initrd ) shift
+            OPT_INITRD=$1; shift
+            ;;
+        --append ) shift
+            OPT_APPEND=$1; shift
+            ;;
+        --qemu-args ) shift
+            OPT_QEMU_ARGS=$1; shift
+            ;;
         * )
             usage quit
             ;;
     esac
 done
 
-# check if we have VBoxManage
-VBOX_VERSION=$(VBoxManage --version 2>/dev/null | cut -f -2 -d '.')
-if [[ -z $VBOX_VERSION ]]; then
-    fatal "VBoxManage not found."
+# resolve backend: explicit option wins, otherwise native aarch64 Macs
+# use QEMU (the engine guest must match the host architecture), everything
+# else uses VirtualBox
+if [[ -z $OPT_BACKEND ]]; then
+    if [[ $UNAME_SYSTEM == "Darwin" && $UNAME_ARCH == "arm64" ]]; then
+        OPT_BACKEND=qemu
+    else
+        OPT_BACKEND=vbox
+    fi
+fi
+
+# check that the virtualization backend is available
+if [[ $OPT_BACKEND == "vbox" ]]; then
+    VBOX_VERSION=$(VBoxManage --version 2>/dev/null | cut -f -2 -d '.')
+    if [[ -z $VBOX_VERSION ]]; then
+        fatal "VBoxManage not found."
+    fi
+else
+    if ! command -v qemu-system-aarch64 >/dev/null; then
+        fatal "qemu-system-aarch64 not found (brew install qemu)"
+    fi
+    if [[ $UNAME_SYSTEM != "Darwin" || $UNAME_ARCH != "arm64" ]]; then
+        echo "WARNING: QEMU backend expects an aarch64 macOS host with native acceleration (hvf)"
+    fi
 fi
 
 # handle the explicit unregister case here
@@ -489,7 +692,9 @@ fi
 OPT_VDI=$(basename $OPT_VDI)
 
 # user can decide to care or not about running vms
-checkForRunningVms
+if [[ $OPT_BACKEND == "vbox" ]]; then
+    checkForRunningVms
+fi
 
 # do we have everything..
 checkForRequiredFiles
@@ -498,8 +703,10 @@ checkForRequiredFiles
 initPaths
 
 # some preliminary checks
-checkVBox
-checkIfVMexists
+if [[ $OPT_BACKEND == "vbox" ]]; then
+    checkVBox
+    checkIfVMexists
+fi
 
 # all go, let's do it:
 echo "Creating $OPT_VM, compression=$OPT_COMPRESSION"
@@ -508,8 +715,8 @@ echo "Creating $OPT_VM, compression=$OPT_COMPRESSION"
     echo "Release:;$OPT_RELEASE"
     echo "MerSDK VDI:;$OPT_VDI"
     echo "Tooling:;$OPT_TOOLING"
-    for targetarch in ${!OPT_TARGETS[*]} ; do
-        echo "${targetarch^^} target:;${OPT_TARGETS[$targetarch]}"
+    for i in ${!OPT_TARGET_ARCHES[*]} ; do
+        echo "$(echo ${OPT_TARGET_ARCHES[$i]} | tr '[:lower:]' '[:upper:]') target:;${OPT_TARGET_FILES[$i]}"
     done
 } |column -t -s ';' |sed 's/^/ /'
 
@@ -559,59 +766,53 @@ fi
 # record start time
 BUILD_START=$(date +%s)
 
-# set up machine in VirtualBox
+# set up machine in the backend
 createVM
 # define the shared directories
 createShares
 # start the VM
 startVM
 
+# on the QEMU backend the 9p shares must be mounted explicitly, the engine
+# has no VirtualBox guest additions to do it
+if [[ $OPT_BACKEND == "qemu" ]]; then
+    mountSharesQemu
+fi
+
 # install tooling to the VM
 installTooling "$OPT_TARGET_BASENAME-$OPT_RELEASE" "$OPT_TOOLING"
 
 # install targets to the VM
 TARGET_NAMES=()
-for targetarch in ${!OPT_TARGETS[*]}; do
-    installTarget "$OPT_TARGET_BASENAME-$OPT_RELEASE-$targetarch" "${OPT_TARGETS[$targetarch]}"
-    TARGET_NAMES+=("$OPT_TARGET_BASENAME-$OPT_RELEASE-$targetarch")
+for i in ${!OPT_TARGET_ARCHES[*]}; do
+    installTarget "$OPT_TARGET_BASENAME-$OPT_RELEASE-${OPT_TARGET_ARCHES[$i]}" "${OPT_TARGET_FILES[$i]}"
+    TARGET_NAMES+=("$OPT_TARGET_BASENAME-$OPT_RELEASE-${OPT_TARGET_ARCHES[$i]}")
 done
 
 if [[ -n $OPT_HACKIT ]]; then
     echo "### EMBARRASSING HACK! CLEANING jolla-core.check!!!"
-    ssh -o UserKnownHostsFile=/dev/null \
-        -o StrictHostKeyChecking=no \
-        -p $SSH_PORT \
-        -i $SSHCONFIG_PATH/vmshare/ssh/private_keys/engine/mersdk \
-        mersdk@localhost "cat /dev/null | sudo tee /etc/zypp/systemCheck.d/jolla-core.check"
+    engine_ssh "cat /dev/null | sudo tee /etc/zypp/systemCheck.d/jolla-core.check"
 fi
 
 # Hack: ensure snapshots are CoW copies also with Docker
-ssh -o UserKnownHostsFile=/dev/null \
-    -o StrictHostKeyChecking=no \
-    -p $SSH_PORT \
-    -i $SSHCONFIG_PATH/vmshare/ssh/private_keys/engine/mersdk \
-    mersdk@localhost "sudo bash /host_home/hack-snapshots-cow.sh"
+engine_ssh "sudo bash /host_home/hack-snapshots-cow.sh"
 
 # refresh the zypper repositories
 if [[ -n $OPT_REFRESH ]]; then
-    ssh -o UserKnownHostsFile=/dev/null \
-        -o StrictHostKeyChecking=no \
-        -p $SSH_PORT \
-        -i $SSHCONFIG_PATH/vmshare/ssh/private_keys/engine/mersdk \
-        mersdk@localhost "sudo bash /host_home/refresh-sdk-repos.sh -y ${OPT_PRIVATE_REPO:-} ${OPT_KEEP_TEST_DOMAIN:-} --release ${OPT_ORIGINAL_RELEASE:-latest}"
+    engine_ssh "sudo bash /host_home/refresh-sdk-repos.sh -y ${OPT_PRIVATE_REPO:-} ${OPT_KEEP_TEST_DOMAIN:-} --release ${OPT_ORIGINAL_RELEASE:-latest}"
 fi
 
 # shut the VM down cleanly so that it has time to flush its disk
-ssh -o UserKnownHostsFile=/dev/null \
-    -o StrictHostKeyChecking=no \
-    -p $SSH_PORT \
-    -i $SSHCONFIG_PATH/vmshare/ssh/private_keys/engine/mersdk \
-    mersdk@localhost "sdk-shutdown"
+engine_ssh "sdk-shutdown"
 
 echo "Giving VM 10 seconds to really shut down ..."
 while [[ $(( waitc++ )) -lt 10 ]]; do
 
-    [[ $(VBoxManage list runningvms | grep -c $OPT_VM) -eq 0 ]] && break
+    if [[ $OPT_BACKEND == "qemu" ]]; then
+        qemu_vm_running || break
+    else
+        [[ $(VBoxManage list runningvms | grep -c $OPT_VM) -eq 0 ]] && break
+    fi
 
     echo "waiting ..."
     sleep 1
@@ -622,26 +823,31 @@ done
 # wrap it all up into 7z file for installer:
 packVM
 
-# start the VM
-createTar
+if [[ $OPT_BACKEND == "vbox" ]]; then
+    # start the VM
+    createTar
 
-packDocker
+    packDocker
+else
+    echo "NOTE: Skipping Docker package (qemu-nbd based, requires a Linux build host)"
+fi
 
 results=($PACKAGE_NAME)
-results+=($DOCKER_PACKAGE_NAME)
 
 if [[ -z $OPT_NO_META ]]; then
-    vdi_capacity=$(vdi_capacity <$INSTALL_PATH/mer.vdi)
-    $BUILD_TOOLS_SRC/make-archive-meta.sh $PACKAGE_NAME "vdi_capacity=$vdi_capacity" \
-        "targets=$(echo -n ${TARGET_NAMES[*]})"
+    if [[ -f $INSTALL_PATH/mer.vdi ]]; then
+        vdi_capacity=$(vdi_capacity <$INSTALL_PATH/mer.vdi)
+        $BUILD_TOOLS_SRC/make-archive-meta.sh $PACKAGE_NAME "vdi_capacity=$vdi_capacity" \
+            "targets=$(echo -n ${TARGET_NAMES[*]})"
+    else
+        $BUILD_TOOLS_SRC/make-archive-meta.sh $PACKAGE_NAME \
+            "targets=$(echo -n ${TARGET_NAMES[*]})"
+    fi
     results+=($PACKAGE_NAME.meta)
-    $BUILD_TOOLS_SRC/make-archive-meta.sh $DOCKER_PACKAGE_NAME \
-        "targets=$(echo -n ${TARGET_NAMES[*]})"
-    results+=($DOCKER_PACKAGE_NAME.meta)
 fi
 
 if [[ -n "$OPT_UPLOAD" ]]; then
-    echo "Uploading $PACKAGE_NAME and $DOCKER_PACKAGE_NAME ..."
+    echo "Uploading build results ..."
 
     # create upload dir
     ssh $OPT_UPLOAD_USER@$OPT_UPLOAD_HOST mkdir -p $OPT_UPLOAD_PATH/$OPT_UL_DIR/
