@@ -1,4 +1,4 @@
-#!/usr/bin/python -tt
+#!/usr/bin/env python3
 
 # Copyright (C) 2015 Jolla Oy
 # Contact: Jussi Pakkanen <jussi.pakkanen@jolla.com>
@@ -31,19 +31,20 @@
 # Download and extract all source dependencies that we have.
 # Run this in ~/invariant (or C:\invariant on Windows).
 
+# Must match DEF_QT_VER in defaults.sh
+QT_VER = '5.15.14'
+
 import platform
 import os, sys
-import urllib
+import urllib.request
 import shutil
 import subprocess
 import tarfile, zipfile
 
-# Only download gzipped files because Python2 does not have xz
-# unpacker. (Python 3 has it.)
-
 downloads = [
-    ('https://download.qt.io/archive/qt/5.6/5.6.2/single/qt-everywhere-opensource-src-5.6.2.tar.gz', 'qt-everywhere-opensource-src-5.6.2.tar.gz', 'qt-everywhere-opensource-src-5.6.2'),
-    ('https://download.qt.io/official_releases/qt-installer-framework/2.0.5/qt-installer-framework-opensource-2.0.5-src.tar.gz', 'qt-installer-framework-opensource-2.0.5-src.tar.gz', 'qt-installer-framework-opensource-2.0.5-src'),
+    ('https://download.qt.io/archive/qt/5.15/%s/single/qt-everywhere-src-%s.tar.xz' % (QT_VER, QT_VER),
+     'qt-everywhere-src-%s.tar.xz' % QT_VER,
+     'qt-everywhere-src-%s' % QT_VER),
     ]
 
 if platform.system() == 'Linux':
@@ -53,7 +54,7 @@ elif platform.system() == 'Windows':
 elif platform.system() == 'Darwin':
     pass # OSX does not need ICU.
 else:
-    print 'Unknown platform:', platform.system()
+    print('Unknown platform:', platform.system())
     sys.exit(1)
 
 for d in downloads:
@@ -62,19 +63,33 @@ for d in downloads:
         os.unlink(fname)
     except Exception:
         pass
-    print 'Downloading', url
-    urllib.urlretrieve(url, fname)
+    print('Downloading', url)
+    urllib.request.urlretrieve(url, fname)
     shutil.rmtree(dirname, ignore_errors=True)
     if fname.endswith('.zip'):
         tf = zipfile.ZipFile(fname, 'r')
     else:
         tf = tarfile.open(fname)
-    print 'Extracting', fname
+    print('Extracting', fname)
     tf.extractall()
 
-print('''You need to install platform build dependencies by hand. On
+# Installer Framework is fetched from git because the Sailfish OS fork does
+# not publish source tarballs. This matches DEF_IFW_SRC_DIR in defaults.sh.
+if not os.path.isdir('qt-installer-framework'):
+    print('Cloning qt-installer-framework')
+    subprocess.check_call(['git', 'clone',
+                           'https://github.com/sailfishos/qt-installer-framework.git',
+                           'qt-installer-framework'])
+
+if platform.system() == 'Linux':
+    print('''You need to install platform build dependencies by hand. On
 Debian-derivatives this means running the following commands:
 
 sudo apt-get install build-essential pkg-config chrpath
 sudo apt-get install "^libxcb.*" libx11-xcb-dev libglu1-mesa-dev libxrender-dev libxi-dev
 sudo apt-get install flex bison gperf libicu-dev libxslt-dev ruby''')
+elif platform.system() == 'Darwin':
+    print('''You need to install platform build dependencies by hand. On
+macOS this means installing Xcode command line tools and, via Homebrew:
+
+brew install p7zip cmake''')
