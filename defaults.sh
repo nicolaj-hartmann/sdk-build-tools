@@ -97,6 +97,8 @@ DEF_VARIANT_PRETTY="Sailfish SDK"
 
 UNAME_SYSTEM=$(uname -s)
 UNAME_ARCH=$(uname -m)
+# Some platforms report aarch64 instead of arm64, normalize for consistency
+[[ $UNAME_ARCH == "aarch64" ]] && UNAME_ARCH="arm64"
 
 if [[ $UNAME_SYSTEM == "Linux" ]] || [[ $UNAME_SYSTEM == "Darwin" ]]; then
     : ${DEF_PREFIX:=$HOME}
@@ -147,12 +149,12 @@ fi
 # ---------------------------------------------------------------------
 # LLVM/Clang
 
-if [[ $UNAME_SYSTEM == "Linux" ]]; then
+if [[ $UNAME_SYSTEM == "Linux" ]] || [[ $UNAME_SYSTEM == "Darwin" && $UNAME_ARCH == "arm64" ]]; then
     DEF_LLVM_SRC_DIR=$DEF_PREFIX/invariant/llvm
     DEF_LLVM_BUILD_DIR=$DEF_PREFIX/invariant/llvm-build
     DEF_LLVM_INSTALL_DIR=$DEF_PREFIX/invariant/llvm-install
 else
-    # On Windows and macOS prebuilt binaries supplied by Qt project are downloaded
+    # On Windows and macOS x86_64 prebuilt binaries supplied by Qt project are downloaded
     DEF_LLVM_DOWNLOAD_DIR=$DEF_PREFIX/invariant
     DEF_LLVM_INSTALL_DIR=$DEF_PREFIX/invariant/libclang
 fi

@@ -1,11 +1,11 @@
 #!/bin/bash
 #
-# On Linux this script builds LLVM/Clang libraries into subdirectories in
-# the $HOME/invariant dir. LLVM sources must be found from the current user's
-# home directory $HOME/invariant/llvm.
+# On Linux and macOS arm64 this script builds LLVM/Clang libraries into
+# subdirectories in the $HOME/invariant dir. LLVM sources must be found from
+# the current user's home directory $HOME/invariant/llvm.
 #
-# On Windows and macOS this script downloads the LLVM/Clang libraries and
-# extracts it into the $HOME/invariant dir.
+# On Windows and macOS x86_64 this script downloads the LLVM/Clang libraries
+# and extracts it into the $HOME/invariant dir.
 #
 #
 # Copyright (C) 2014-2019 Jolla Ltd.
@@ -43,14 +43,30 @@ export LC_ALL=C
 . $(dirname $0)/defaults.sh
 . $(dirname $0)/utils.sh
 
+# Defined in defaults.sh on platforms where LLVM/Clang is built from source
+# (Linux and macOS arm64). Empty when prebuilt binaries are downloaded instead
+# (Windows and macOS x86_64).
+build_from_source() {
+    [[ -n $DEF_LLVM_SRC_DIR ]]
+}
+
 configure_llvm() {
-    export CC=gcc-9 CXX=g++-9
+    if [[ $UNAME_SYSTEM == "Linux" ]]; then
+        export CC=gcc-9 CXX=g++-9
+    else
+        # On macOS build natively with the Apple toolchain; be explicit about
+        # the target architecture so that a non-native cmake cannot hijack the
+        # build (e.g. an x86_64 cmake running under Rosetta)
+        export CC=clang CXX=clang++
+        local cmake_arch_args="-D CMAKE_OSX_ARCHITECTURES=$UNAME_ARCH"
+    fi
     # See Qt Creator's README
     cmake \
         -D CMAKE_BUILD_TYPE=Release \
         -D LLVM_ENABLE_RTTI=ON \
         -D LLVM_ENABLE_PROJECTS="clang;clang-tools-extra" \
         -D CMAKE_INSTALL_PREFIX=$DEF_LLVM_INSTALL_DIR \
+        $cmake_arch_args \
         $DEF_LLVM_SRC_DIR/llvm
 }
 
@@ -97,7 +113,7 @@ fail() {
 }
 
 usage() {
-    if [[ $(build_arch) == "linux" ]]; then
+    if build_from_source; then
         cat <<EOF
 Build LLVM/Clang
 
@@ -154,9 +170,9 @@ while [[ ${1:-} ]]; do
     esac
 done
 
-if [[ $(build_arch) == "linux" ]]; then
+if build_from_source; then
     echo "Using sources from [$DEF_LLVM_SRC_DIR]"
-elif [[ $(build_arch) == "mac" ]]; then
+elif [[ $UNAME_SYSTEM == "Darwin" ]]; then
     echo "Downloading LLVM/Clang from [$DEF_MAC_LLVM_DOWNLOAD_URL]"
 else
     echo "Downloading LLVM/Clang from [$DEF_WIN_LLVM_DOWNLOAD_URL]"
@@ -180,11 +196,11 @@ if [[ -z $OPT_YES ]]; then
     done
 fi
 
-if [[ $(build_arch) != "linux" && ! -d $DEF_LLVM_DOWNLOAD_DIR ]]; then
+if ! build_from_source && [[ ! -d $DEF_LLVM_DOWNLOAD_DIR ]]; then
     fail "directory [$DEF_LLVM_DOWNLOAD_DIR] does not exist"
 fi
 
-if [[ $(build_arch) == "linux" && ! -d $DEF_LLVM_SRC_DIR ]]; then
+if build_from_source && [[ ! -d $DEF_LLVM_SRC_DIR ]]; then
     fail "directory [$DEF_LLVM_SRC_DIR] does not exist"
 fi
 
@@ -194,7 +210,7 @@ set -e
 # record start time
 BUILD_START=$(date +%s)
 
-if [[ $(build_arch) == "linux" ]]; then
+if build_from_source; then
     build_llvm
 else
     download_llvm_"$(build_arch)"
